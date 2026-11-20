@@ -40,10 +40,23 @@ uses
 type
   EDocxTemplateError = class(Exception);
 
+  THeadingEntry = record
+    Name: string;      // 书签内部名称，如 _Toc1
+    Text: string;      // 标题文字
+    Level: Integer;    // 标题层级
+    ParaIndex: Integer;// 在正文段落中的序号（从 0 开始）
+  end;
+
   TDocxTemplate = class
   private
     FDoc: IWordDocument;
     FBaseDir: string;
+    FHeadings: TArray<THeadingEntry>;
+    FTocEnabled: Boolean;
+    FTocTitle: string;
+    FTocMaxLevel: Integer;
+    FTocPageNumbers: Boolean;
+    FTocPageBreakAfter: Boolean;
 
     procedure ApplyParagraphProps(Para: IWordParagraph; Obj: TJSONObject);
     procedure ApplyRunProps(Run: IWordRun; Obj: TJSONObject);
@@ -61,15 +74,22 @@ type
     function PrepareImage(const Block: TJSONObject; out Data: TBytes;
       out Ext: string; out W, H: Integer): Boolean;
     class function ReadImageSize(const Data: TBytes; out W, H: Integer): Boolean; static;
+
+    procedure LoadFromJsonText(const AJsonText, ABaseDir: string);
+    procedure ApplyRootSettings(Root: TJSONObject);
+    procedure RenderContent(Root: TJSONObject);
+    procedure ParseTocSettings(Root: TJSONObject);
+    function BuildTocXml: string;
+    function InjectBookmarks(const Xml: string): string;
+    function SaveWithToc(const FileName: string): Boolean;
   public
     constructor Create;
-    procedure LoadConfig(const FileName: string);overload;
-    procedure LoadConfig(const AJsonText: string;ABaseDir:string); overload;
+    procedure LoadConfig(const FileName: string); overload;
+    procedure LoadConfig(const AJsonText, ABaseDir: string); overload;
     procedure SaveTo(const FileName: string);
 
-    class function Generate(const ConfigFile, OutputFile: string): IWordDocument;overload; static;
-
-    class function Generate(const AJsonText,ABaseDir, OutputFile: string): IWordDocument; overload;static;
+    class function Generate(const ConfigFile, OutputFile: string): IWordDocument; overload; static;
+    class function Generate(const AJsonText, ABaseDir, OutputFile: string): IWordDocument; overload; static;
 
     property Document: IWordDocument read FDoc;
   end;
@@ -79,6 +99,8 @@ implementation
 uses
   System.IOUtils,
   System.Math,
+  System.StrUtils,
+  System.Zip,
   System.Generics.Collections,
   System.NetEncoding;
 
@@ -272,6 +294,52 @@ begin
             (D[Index + 2] shl 16) or (D[Index + 3] shl 24);
 end;
 
+function XmlEscape(const S: string): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 1 to Length(S) do
+    case S[I] of
+      '&': Result := Result + '&amp;';
+      '<': Result := Result + '&lt;';
+      '>': Result := Result + '&gt;';
+      '"': Result := Result + '&quot;';
+      '''': Result := Result + '&apos;';
+    else
+      Result := Result + S[I];
+    end;
+end;
+
+function NextRelationshipId(const Rels: string): Integer;
+var
+  P: Integer;
+  S: string;
+  N: Integer;
+begin
+  Result := 1;
+  P := Pos('Id="rId', Rels);
+  while P > 0 do
+  begin
+    S := Copy(Rels, P + 7, 24);
+    if Pos('"', S) > 0 then
+    begin
+      N := StrToIntDef(Copy(S, 1, Pos('"', S) - 1), 0);
+      if N >= Result then
+        Result := N + 1;
+    end;
+    P := PosEx('Id="rId', Rels, P + 7);
+  end;
+end;
+
+const
+  WordNs = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+  SettingsPart = 'word/settings.xml';
+  SettingsRelationshipType =
+    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings';
+  SettingsContentType =
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml';
+
 { ------------------------------- TDocxTemplate ---------------------------- }
 
 constructor TDocxTemplate.Create;
@@ -279,6 +347,12 @@ begin
   inherited Create;
   FDoc := TWordDocumentFactory.CreateDocument;
   FBaseDir := '';
+  FHeadings := nil;
+  FTocEnabled := True;
+  FTocTitle := '目录';
+  FTocMaxLevel := 3;
+  FTocPageNumbers := True;
+  FTocPageBreakAfter := True;
 end;
 
 procedure TDocxTemplate.ApplyParagraphProps(Para: IWordParagraph; Obj: TJSONObject);
@@ -373,6 +447,13 @@ begin
     end;
     Run.FontName := DefaultFontName;
     Run.FontColor := NormalizeColor(JStr(Block, 'color', '1F3864'));
+
+    // 记录标题，供目录书签与内部跳转使用
+    SetLength(FHeadings, Length(FHeadings) + 1);
+    FHeadings[High(FHeadings)].Name := '_Toc' + IntToStr(Length(FHeadings));
+    FHeadings[High(FHeadings)].Text := JStr(Block, 'text', '');
+    FHeadings[High(FHeadings)].Level := Level;
+    FHeadings[High(FHeadings)].ParaIndex := FDoc.ParagraphCount - 1;
   end
   else
   begin
@@ -775,118 +856,326 @@ begin
     raise EDocxTemplateError.Create('未知内容类型：' + Kind);
 end;
 
-procedure TDocxTemplate.LoadConfig(const FileName: string);
+procedure TDocxTemplate.ParseTocSettings(Root: TJSONObject);
 var
-  Text: string;
-  Root, Page: TJSONObject;
+  Toc: TJSONObject;
+begin
+  FTocEnabled := True;
+  FTocTitle := '目录';
+  FTocMaxLevel := 3;
+  FTocPageNumbers := True;
+  FTocPageBreakAfter := True;
+
+  Toc := JObj(Root, 'toc');
+  if Toc <> nil then
+  begin
+    if JValue(Toc, 'enabled') <> nil then
+      FTocEnabled := JBool(Toc, 'enabled', True);
+    FTocTitle := JStr(Toc, 'title', FTocTitle);
+    FTocMaxLevel := JInt(Toc, 'maxLevel', FTocMaxLevel);
+    FTocPageNumbers := JBool(Toc, 'pageNumbers', FTocPageNumbers);
+    FTocPageBreakAfter := JBool(Toc, 'pageBreakAfter', FTocPageBreakAfter);
+  end
+  else
+  begin
+    if JValue(Root, 'generateToc') <> nil then
+      FTocEnabled := JBool(Root, 'generateToc', True);
+    FTocTitle := JStr(Root, 'tocTitle', FTocTitle);
+    FTocMaxLevel := JInt(Root, 'tocMaxLevel', FTocMaxLevel);
+    FTocPageNumbers := JBool(Root, 'tocPageNumbers', FTocPageNumbers);
+    FTocPageBreakAfter := JBool(Root, 'tocPageBreakAfter', FTocPageBreakAfter);
+  end;
+
+  if FTocMaxLevel < 1 then
+    FTocMaxLevel := 1;
+  if FTocMaxLevel > 4 then
+    FTocMaxLevel := 4;
+end;
+
+function TDocxTemplate.BuildTocXml: string;
+var
+  I, Indent: Integer;
+  H: THeadingEntry;
+  RunProps: string;
+begin
+  Result :=
+    '<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:after="240"/></w:pPr>' +
+    '<w:r><w:rPr><w:rFonts w:ascii="Microsoft YaHei" w:hAnsi="Microsoft YaHei"/>' +
+    '<w:b/><w:sz w:val="36"/></w:rPr><w:t>' + XmlEscape(FTocTitle) + '</w:t></w:r></w:p>';
+
+  RunProps := '<w:rPr><w:rFonts w:ascii="Microsoft YaHei" w:hAnsi="Microsoft YaHei"/>' +
+    '<w:sz w:val="20"/></w:rPr>';
+
+  for I := 0 to High(FHeadings) do
+  begin
+    H := FHeadings[I];
+    if H.Level > FTocMaxLevel then
+      Continue;
+
+    Indent := 360 * (H.Level - 1);
+    Result := Result +
+      '<w:p><w:pPr>' +
+        '<w:ind w:left="' + IntToStr(Indent) + '"/>' +
+        '<w:tabs><w:tab w:val="right" w:leader="dot" w:pos="9360"/></w:tabs>' +
+        '<w:spacing w:after="80"/>' +
+      '</w:pPr>' +
+      '<w:hyperlink w:anchor="' + H.Name + '" w:history="1">' +
+        '<w:r>' + RunProps + '<w:t xml:space="preserve">' +
+          XmlEscape(H.Text) + '</w:t></w:r>';
+
+    if FTocPageNumbers then
+    begin
+      Result := Result +
+        '<w:r>' + RunProps + '<w:tab/></w:r>' +
+        '<w:r><w:fldChar w:fldCharType="begin"/></w:r>' +
+        '<w:r><w:instrText xml:space="preserve"> PAGEREF ' + H.Name +
+          ' \h </w:instrText></w:r>' +
+        '<w:r><w:fldChar w:fldCharType="separate"/></w:r>' +
+        '<w:r>' + RunProps + '<w:t>1</w:t></w:r>' +
+        '<w:r><w:fldChar w:fldCharType="end"/></w:r>';
+    end;
+
+    Result := Result + '</w:hyperlink></w:p>';
+  end;
+
+  if FTocPageBreakAfter then
+    Result := Result + '<w:p><w:r><w:br w:type="page"/></w:r></w:p>';
+end;
+
+function TDocxTemplate.InjectBookmarks(const Xml: string): string;
+var
+  P, StartPos, EndPos, ParaIdx, HIdx, Id: Integer;
+  BookmarkStart, BookmarkEnd: string;
+begin
+  Result := '';
+  P := 1;
+  ParaIdx := 0;
+  HIdx := 0;
+  Id := 1;
+
+  while HIdx <= High(FHeadings) do
+  begin
+    StartPos := PosEx('<w:p>', Xml, P);
+    if StartPos = 0 then
+      Break;
+    EndPos := PosEx('</w:p>', Xml, StartPos + 5);
+    if EndPos = 0 then
+      Break;
+
+    if ParaIdx = FHeadings[HIdx].ParaIndex then
+    begin
+      BookmarkStart := '<w:bookmarkStart w:id="' + IntToStr(Id) +
+        '" w:name="' + FHeadings[HIdx].Name + '"/>';
+      BookmarkEnd := '<w:bookmarkEnd w:id="' + IntToStr(Id) + '"/>';
+      Result := Result + Copy(Xml, P, StartPos - P) +
+        '<w:p>' + BookmarkStart +
+        Copy(Xml, StartPos + 5, EndPos - (StartPos + 5)) +
+        BookmarkEnd + '</w:p>';
+      P := EndPos + 6;
+      Inc(HIdx);
+      Inc(Id);
+    end
+    else
+    begin
+      Result := Result + Copy(Xml, P, EndPos + 6 - P);
+      P := EndPos + 6;
+    end;
+    Inc(ParaIdx);
+  end;
+
+  Result := Result + Copy(Xml, P, Length(Xml) - P + 1);
+end;
+
+function TDocxTemplate.SaveWithToc(const FileName: string): Boolean;
+var
+  Mem: TMemoryStream;
+  ZipIn, ZipOut: TZipFile;
+  FS: TFileStream;
+  Names: TArray<string>;
+  Contents: TArray<TBytes>;
+  I: Integer;
+  Name, DocXml, RelsXml, CTXml: string;
+  Data: TBytes;
+  NewRel: string;
+  HasSettings: Boolean;
+begin
+  Result := False;
+  if (not FTocEnabled) or (Length(FHeadings) = 0) then
+    Exit;
+
+  Mem := TMemoryStream.Create;
+  ZipIn := TZipFile.Create;
+  try
+    FDoc.SaveToStream(Mem);
+    Mem.Position := 0;
+    ZipIn.Open(Mem, zmRead);
+
+    SetLength(Names, ZipIn.FileCount);
+    SetLength(Contents, ZipIn.FileCount);
+    DocXml := '';
+    RelsXml := '';
+    CTXml := '';
+    HasSettings := False;
+
+    for I := 0 to ZipIn.FileCount - 1 do
+    begin
+      Names[I] := ZipIn.FileNames[I];
+      ZipIn.Read(I, Data);
+      Contents[I] := Data;
+      Name := Names[I];
+      if Name = SettingsPart then
+        HasSettings := True
+      else if Name = 'word/document.xml' then
+        DocXml := TEncoding.UTF8.GetString(Data)
+      else if Name = 'word/_rels/document.xml.rels' then
+        RelsXml := TEncoding.UTF8.GetString(Data)
+      else if Name = '[Content_Types].xml' then
+        CTXml := TEncoding.UTF8.GetString(Data);
+    end;
+  finally
+    ZipIn.Free;
+    Mem.Free;
+  end;
+
+  // 1) 给标题段落加书签，并在正文开头插入目录页
+  DocXml := InjectBookmarks(DocXml);
+  DocXml := StringReplace(DocXml, '<w:body>',
+    '<w:body>' + BuildTocXml, []);
+
+  // 2) 页码字段需要 Word 打开时更新
+  if FTocPageNumbers then
+  begin
+    if Pos('PartName="/word/settings.xml"', CTXml) = 0 then
+      CTXml := StringReplace(CTXml, '</Types>',
+        '<Override PartName="/word/settings.xml" ContentType="' +
+        SettingsContentType + '"/></Types>', []);
+
+    if Pos(SettingsRelationshipType, RelsXml) = 0 then
+    begin
+      NewRel := '<Relationship Id="rId' + IntToStr(NextRelationshipId(RelsXml)) +
+        '" Type="' + SettingsRelationshipType + '" Target="settings.xml"/>';
+      RelsXml := StringReplace(RelsXml, '</Relationships>',
+        NewRel + '</Relationships>', []);
+    end;
+  end;
+
+  for I := 0 to High(Names) do
+  begin
+    if Names[I] = 'word/document.xml' then
+      Contents[I] := TEncoding.UTF8.GetBytes(DocXml)
+    else if Names[I] = 'word/_rels/document.xml.rels' then
+      Contents[I] := TEncoding.UTF8.GetBytes(RelsXml)
+    else if Names[I] = '[Content_Types].xml' then
+      Contents[I] := TEncoding.UTF8.GetBytes(CTXml);
+  end;
+
+  FS := TFileStream.Create(FileName, fmCreate);
+  ZipOut := TZipFile.Create;
+  try
+    ZipOut.Open(FS, zmWrite);
+    for I := 0 to High(Names) do
+      ZipOut.Add(Contents[I], Names[I]);
+
+    if FTocPageNumbers and (not HasSettings) then
+      ZipOut.Add(
+        TEncoding.UTF8.GetBytes(
+          '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+          '<w:settings xmlns:w="' + WordNs + '">' +
+          '<w:updateFields w:val="true"/>' +
+          '</w:settings>'),
+        SettingsPart);
+  finally
+    ZipOut.Free;
+    FS.Free;
+  end;
+  Result := True;
+end;
+
+procedure TDocxTemplate.ApplyRootSettings(Root: TJSONObject);
+var
+  Page: TJSONObject;
+begin
+  Page := JObj(Root, 'page');
+  if Page <> nil then
+  begin
+    if LowerCase(JStr(Page, 'orientation', 'portrait')) = 'landscape' then
+      FDoc.PageOrientation := TPageOrientation.Landscape
+    else
+      FDoc.PageOrientation := TPageOrientation.Portrait;
+
+    FDoc.PageMargins := TPageMargins.Create(
+      PtToTwips(JInt(Page, 'marginTop', 72)),
+      PtToTwips(JInt(Page, 'marginBottom', 72)),
+      PtToTwips(JInt(Page, 'marginLeft', 72)),
+      PtToTwips(JInt(Page, 'marginRight', 72)));
+  end
+  else
+    FDoc.PageMargins := TPageMargins.Create(1440, 1440, 1440, 1440);
+
+  FDoc.Header.Text := JStr(Root, 'header', '');
+  FDoc.Footer.Text := JStr(Root, 'footer', '');
+  ParseTocSettings(Root);
+end;
+
+procedure TDocxTemplate.RenderContent(Root: TJSONObject);
+var
   Content: TJSONArray;
   I: Integer;
+begin
+  Content := JArray(Root, 'content');
+  if Content = nil then
+    raise EDocxTemplateError.Create('配置缺少 content 数组');
+
+  for I := 0 to Content.Count - 1 do
+    if Content.Items[I] is TJSONObject then
+      RenderBlock(TJSONObject(Content.Items[I]));
+end;
+
+procedure TDocxTemplate.LoadFromJsonText(const AJsonText, ABaseDir: string);
+var
+  Text: string;
+  Root: TJSONObject;
   JSON: TJSONValue;
 begin
-  if not TFile.Exists(FileName) then
-    raise EDocxTemplateError.Create('配置文件不存在：' + FileName);
-
-  Text := TFile.ReadAllText(FileName, TEncoding.UTF8);
-  if (Text <> '') and (Text[1] = #$FEFF) then
+  Text := Trim(AJsonText);
+  if Text = '' then
+    Exit;
+  if Text[1] = #$FEFF then
     Delete(Text, 1, 1);
 
   JSON := TJSONObject.ParseJSONValue(Text);
   if JSON = nil then
-    raise EDocxTemplateError.Create('JSON 解析失败：' + FileName);
+    raise EDocxTemplateError.Create('JSON 解析失败：' + Copy(Text, 1, 200));
   try
     if not (JSON is TJSONObject) then
       raise EDocxTemplateError.Create('配置根节点必须是 JSON 对象');
     Root := TJSONObject(JSON);
 
-    FBaseDir := TPath.GetDirectoryName(TPath.GetFullPath(FileName));
+    FBaseDir := ABaseDir;
     FDoc := TWordDocumentFactory.CreateDocument;
+    FHeadings := nil;
 
-    Page := JObj(Root, 'page');
-    if Page <> nil then
-    begin
-      if LowerCase(JStr(Page, 'orientation', 'portrait')) = 'landscape' then
-        FDoc.PageOrientation := TPageOrientation.Landscape
-      else
-        FDoc.PageOrientation := TPageOrientation.Portrait;
-
-      FDoc.PageMargins := TPageMargins.Create(
-        PtToTwips(JInt(Page, 'marginTop', 72)),
-        PtToTwips(JInt(Page, 'marginBottom', 72)),
-        PtToTwips(JInt(Page, 'marginLeft', 72)),
-        PtToTwips(JInt(Page, 'marginRight', 72)));
-    end
-    else
-      FDoc.PageMargins := TPageMargins.Create(1440, 1440, 1440, 1440);
-
-    FDoc.Header.Text := JStr(Root, 'header', '');
-    FDoc.Footer.Text := JStr(Root, 'footer', '');
-
-    Content := JArray(Root, 'content');
-    if Content = nil then
-      raise EDocxTemplateError.Create('配置缺少 content 数组');
-
-    for I := 0 to Content.Count - 1 do
-      if Content.Items[I] is TJSONObject then
-        RenderBlock(TJSONObject(Content.Items[I]));
+    ApplyRootSettings(Root);
+    RenderContent(Root);
   finally
     JSON.Free;
   end;
 end;
 
-procedure TDocxTemplate.LoadConfig(const AJsonText: string;ABaseDir:string);
+procedure TDocxTemplate.LoadConfig(const FileName: string);
 var
   Text: string;
-  Root, Page: TJSONObject;
-  Content: TJSONArray;
-  I: Integer;
-  JSON: TJSONValue;
 begin
-  if ''=AJsonText.Trim then  Exit;
-  
+  if not TFile.Exists(FileName) then
+    raise EDocxTemplateError.Create('配置文件不存在：' + FileName);
 
-  JSON := TJSONObject.ParseJSONValue(AJsonText);
-  if JSON = nil then
-    raise EDocxTemplateError.Create('JSON 解析失败：' + AJsonText);
-  try
-    if not (JSON is TJSONObject) then
-      raise EDocxTemplateError.Create('配置根节点必须是 JSON 对象');
-    Root := TJSONObject(JSON);
+  Text := TFile.ReadAllText(FileName, TEncoding.UTF8);
+  LoadFromJsonText(Text, TPath.GetDirectoryName(TPath.GetFullPath(FileName)));
+end;
 
-    ////C:\Users\yls\Desktop\pdfview\rar_creator
-   // FBaseDir := TPath.GetDirectoryName(TPath.GetFullPath(FileName));
-    FBaseDir :=ABaseDir;
-    FDoc := TWordDocumentFactory.CreateDocument;
-
-    Page := JObj(Root, 'page');
-    if Page <> nil then
-    begin
-      if LowerCase(JStr(Page, 'orientation', 'portrait')) = 'landscape' then
-        FDoc.PageOrientation := TPageOrientation.Landscape
-      else
-        FDoc.PageOrientation := TPageOrientation.Portrait;
-
-      FDoc.PageMargins := TPageMargins.Create(
-        PtToTwips(JInt(Page, 'marginTop', 72)),
-        PtToTwips(JInt(Page, 'marginBottom', 72)),
-        PtToTwips(JInt(Page, 'marginLeft', 72)),
-        PtToTwips(JInt(Page, 'marginRight', 72)));
-    end
-    else
-      FDoc.PageMargins := TPageMargins.Create(1440, 1440, 1440, 1440);
-
-    FDoc.Header.Text := JStr(Root, 'header', '');
-    FDoc.Footer.Text := JStr(Root, 'footer', '');
-
-    Content := JArray(Root, 'content');
-    if Content = nil then
-      raise EDocxTemplateError.Create('配置缺少 content 数组');
-
-    for I := 0 to Content.Count - 1 do
-      if Content.Items[I] is TJSONObject then
-        RenderBlock(TJSONObject(Content.Items[I]));
-  finally
-    JSON.Free;
-  end;
+procedure TDocxTemplate.LoadConfig(const AJsonText, ABaseDir: string);
+begin
+  LoadFromJsonText(AJsonText, ABaseDir);
 end;
 
 procedure TDocxTemplate.SaveTo(const FileName: string);
@@ -896,7 +1185,9 @@ begin
   Dir := TPath.GetDirectoryName(TPath.GetFullPath(FileName));
   if (Dir <> '') and (not TDirectory.Exists(Dir)) then
     TDirectory.CreateDirectory(Dir);
-  FDoc.SaveToFile(FileName);
+
+  if not SaveWithToc(FileName) then
+    FDoc.SaveToFile(FileName);
 end;
 
 class function TDocxTemplate.Generate(const ConfigFile,
@@ -914,20 +1205,19 @@ begin
   end;
 end;
 
-class function TDocxTemplate.Generate(const AJsonText,ABaseDir, OutputFile: string): IWordDocument;
-begin
+class function TDocxTemplate.Generate(const AJsonText, ABaseDir,
+  OutputFile: string): IWordDocument;
 var
   Tpl: TDocxTemplate;
 begin
   Tpl := TDocxTemplate.Create;
   try
-    Tpl.LoadConfig(AJsonText,ABaseDir);
+    Tpl.LoadConfig(AJsonText, ABaseDir);
     Tpl.SaveTo(OutputFile);
     Result := Tpl.Document;
   finally
     Tpl.Free;
   end;
-end;
 end;
 
 end.

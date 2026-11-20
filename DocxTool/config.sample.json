@@ -1,6 +1,13 @@
 {
   "header": "通用 Word 文档生成工具 · 示例输出",
   "footer": "由 DocxGen + OfficeXML4D 生成",
+  "toc": {
+    "enabled": true,
+    "title": "目录",
+    "maxLevel": 3,
+    "pageNumbers": true,
+    "pageBreakAfter": true
+  },
   "page": {
     "orientation": "portrait",
     "marginTop": 72,
@@ -35,10 +42,9 @@
       ]
     },
     {
-      "type": "paragraph",
+      "type": "heading",
+      "level": 2,
       "text": "一、本周要点",
-      "bold": true,
-      "fontSize": 12,
       "color": "1F3864",
       "spaceBefore": 10,
       "spaceAfter": 4
@@ -53,12 +59,18 @@
       ]
     },
     {
-      "type": "paragraph",
+      "type": "heading",
+      "level": 2,
       "text": "二、执行步骤",
-      "bold": true,
-      "fontSize": 12,
       "color": "1F3864",
       "spaceBefore": 10,
+      "spaceAfter": 4
+    },
+    {
+      "type": "heading",
+      "level": 3,
+      "text": "2.1 配置与运行",
+      "color": "2E5496",
       "spaceAfter": 4
     },
     {
@@ -85,13 +97,9 @@
       "caption": "图 2：自动生成的数据图表示意"
     },
     {
-      "type": "pagebreak"
-    },
-    {
-      "type": "paragraph",
+      "type": "heading",
+      "level": 2,
       "text": "三、数据明细（表格在分页之后）",
-      "bold": true,
-      "fontSize": 12,
       "color": "1F3864"
     },
     {

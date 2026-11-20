@@ -6,8 +6,9 @@
   通用 Word 内容生成器（Delphi 11.3 + OfficeXML4D）。
 
   只依赖工作空间中的 OfficeXML4D 库和系统自带单元（System.JSON 等），
-  通过 JSON 配置描述文档内容，生成包含文字、格式、列表、表格、
-  分页以及嵌入式图片的 .docx 文件。
+  通过 JSON 配置描述文档内容，生成包含文字、样式、列表、表格、
+  分页、嵌入式图片、目录书签跳转以及首行字符缩进（中英文自适应）
+  的 .docx 文件。
 
   典型用法：
 
@@ -26,6 +27,8 @@
     end;
 
   配置说明见随附的 config.sample.json。
+  注意：firstLineChars / firstLineIndentChars 的单位是“字符个数”，
+  写出时换算为 OOXML 的百分之一字符；firstLine / firstLineTwips 为 twips。
   ---------------------------------------------------------------------------
 }
 
@@ -57,8 +60,13 @@ type
     FTocMaxLevel: Integer;
     FTocPageNumbers: Boolean;
     FTocPageBreakAfter: Boolean;
+    FDefaultFirstLineChars: Integer;
+    FParaFirstLineChars: TArray<Integer>; // 与正文段落一一对应的首行缩进字符数
 
-    procedure ApplyParagraphProps(Para: IWordParagraph; Obj: TJSONObject);
+    function AddTrackedParagraph(FirstLineChars: Integer): IWordParagraph;
+    function BlockFirstLineChars(Block: TJSONObject; DefaultChars: Integer): Integer;
+    procedure ApplyParagraphProps(Para: IWordParagraph; Obj: TJSONObject;
+      FirstLineChars: Integer);
     procedure ApplyRunProps(Run: IWordRun; Obj: TJSONObject);
 
     procedure RenderBlock(Block: TJSONObject);
@@ -81,6 +89,7 @@ type
     procedure ParseTocSettings(Root: TJSONObject);
     function BuildTocXml: string;
     function InjectBookmarks(const Xml: string): string;
+    function InjectFirstLineChars(const Xml: string): string;
     function SaveWithToc(const FileName: string): Boolean;
   public
     constructor Create;
@@ -340,6 +349,51 @@ const
   SettingsContentType =
     'application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml';
 
+{ 首行缩进辅助：判断文本是否含中日韩全角字符 }
+
+function HasWideChar(const S: string): Boolean;
+var
+  I: Integer;
+  C: Word;
+begin
+  Result := False;
+  for I := 1 to Length(S) do
+  begin
+    C := Ord(S[I]);
+    if ((C >= $1100) and (C <= $115F)) or ((C >= $2E80) and (C <= $A4CF)) or
+       ((C >= $AC00) and (C <= $D7A3)) or ((C >= $F900) and (C <= $FAFF)) or
+       ((C >= $FE30) and (C <= $FE6F)) or ((C >= $FF00) and (C <= $FF60)) or
+       ((C >= $FFE0) and (C <= $FFE6)) then
+      Exit(True);
+  end;
+end;
+
+{ 为不支持 firstLineChars 的阅读器给出 twips 兜底值：
+  中文按两个全角字符宽，英文按两个半角字符宽。 }
+function EstimateIndentTwips(Block: TJSONObject; Chars: Integer): Integer;
+var
+  Text: string;
+  Runs: TJSONArray;
+  I: Integer;
+  FontPt: Double;
+begin
+  Text := JStr(Block, 'text', JStr(Block, 'value', ''));
+  Runs := JArray(Block, 'runs');
+  if Runs <> nil then
+    for I := 0 to Runs.Count - 1 do
+      if Runs.Items[I] is TJSONObject then
+        Text := Text + JStr(TJSONObject(Runs.Items[I]), 'text', '');
+
+  FontPt := JDouble(Block, 'fontSize', DefaultFontSizePt);
+  if FontPt <= 0 then
+    FontPt := DefaultFontSizePt;
+
+  if HasWideChar(Text) then
+    Result := Round(Chars * FontPt * 20)   // 全角：1 字符 = 1 磅字号
+  else
+    Result := Round(Chars * FontPt * 10);  // 半角：1 字符 = 半个字号
+end;
+
 { ------------------------------- TDocxTemplate ---------------------------- }
 
 constructor TDocxTemplate.Create;
@@ -348,6 +402,8 @@ begin
   FDoc := TWordDocumentFactory.CreateDocument;
   FBaseDir := '';
   FHeadings := nil;
+  FParaFirstLineChars := nil;
+  FDefaultFirstLineChars := 2;
   FTocEnabled := True;
   FTocTitle := '目录';
   FTocMaxLevel := 3;
@@ -355,10 +411,47 @@ begin
   FTocPageBreakAfter := True;
 end;
 
-procedure TDocxTemplate.ApplyParagraphProps(Para: IWordParagraph; Obj: TJSONObject);
+function TDocxTemplate.AddTrackedParagraph(
+  FirstLineChars: Integer): IWordParagraph;
+begin
+  Result := FDoc.AddParagraph;
+  SetLength(FParaFirstLineChars, Length(FParaFirstLineChars) + 1);
+  FParaFirstLineChars[High(FParaFirstLineChars)] := FirstLineChars;
+end;
+
+function TDocxTemplate.BlockFirstLineChars(Block: TJSONObject;
+  DefaultChars: Integer): Integer;
+var
+  HasExplicitTwips: Boolean;
+begin
+  // 无显式字符配置时：段落块用全局默认值，其他块默认不缩进。
+  // 若块内同时给了 firstLine(twips)，则保留 twips 写法，不再按字符注入。
+  Result := DefaultChars;
+  if Block = nil then
+    Exit;
+
+  HasExplicitTwips := (JValue(Block, 'firstLine') <> nil) or
+    (JValue(Block, 'firstLineTwips') <> nil);
+
+  if JValue(Block, 'firstLineChars') <> nil then
+    Result := JInt(Block, 'firstLineChars', DefaultChars)
+  else if JValue(Block, 'indentChars') <> nil then
+    Result := JInt(Block, 'indentChars', DefaultChars)
+  else if HasExplicitTwips then
+    Result := 0;
+
+  if Result < 0 then
+    Result := 0;
+  if Result > 20 then
+    Result := 20;
+end;
+
+procedure TDocxTemplate.ApplyParagraphProps(Para: IWordParagraph;
+  Obj: TJSONObject; FirstLineChars: Integer);
 var
   L: Double;
   S: string;
+  FirstLineTwips: Integer;
 begin
   if Obj = nil then
     Exit;
@@ -378,10 +471,16 @@ begin
     Para.LineSpacing := TLineSpacing.Create(0, TLineSpacingRule.Auto,
       PtToTwips(JInt(Obj, 'spaceBefore', 0)), PtToTwips(JInt(Obj, 'spaceAfter', 0)));
 
+  FirstLineTwips := PtToTwips(JInt(Obj, 'firstLine', 0));
+  if JValue(Obj, 'firstLineTwips') <> nil then
+    FirstLineTwips := JInt(Obj, 'firstLineTwips', 0);
+  if (FirstLineTwips = 0) and (FirstLineChars > 0) then
+    FirstLineTwips := EstimateIndentTwips(Obj, FirstLineChars);
+
   Para.Indent := TParagraphIndent.Create(
     PtToTwips(JInt(Obj, 'indentLeft', 0)),
     PtToTwips(JInt(Obj, 'indentRight', 0)),
-    PtToTwips(JInt(Obj, 'firstLine', 0)));
+    FirstLineTwips);
 end;
 
 procedure TDocxTemplate.ApplyRunProps(Run: IWordRun; Obj: TJSONObject);
@@ -423,12 +522,17 @@ var
   Para: IWordParagraph;
   Run: IWordRun;
   S: string;
-  Level: Integer;
+  Level, Chars: Integer;
 begin
-  Para := FDoc.AddParagraph;
-  ApplyParagraphProps(Para, Block);
+  S := LowerCase(Trim(JStr(Block, 'type', 'paragraph')));
+  if (S = 'paragraph') or (S = 'text') then
+    Chars := BlockFirstLineChars(Block, FDefaultFirstLineChars)
+  else
+    Chars := BlockFirstLineChars(Block, 0);
 
-  S := JStr(Block, 'type', '');
+  Para := AddTrackedParagraph(Chars);
+  ApplyParagraphProps(Para, Block, Chars);
+
   if (S = 'heading') or (S = 'title') then
   begin
     Level := JInt(Block, 'level', 1);
@@ -469,9 +573,12 @@ var
   I: Integer;
   Item: TJSONObject;
   Run: IWordRun;
+  Chars: Integer;
 begin
-  Para := FDoc.AddParagraph;
-  ApplyParagraphProps(Para, Block);
+  // runs 块不默认缩进；如需缩进可在该块写 firstLineChars
+  Chars := BlockFirstLineChars(Block, 0);
+  Para := AddTrackedParagraph(Chars);
+  ApplyParagraphProps(Para, Block, Chars);
   Runs := JArray(Block, 'runs');
   if Runs = nil then
     Exit;
@@ -505,16 +612,18 @@ var
   Para: IWordParagraph;
   Run: IWordRun;
   Style: string;
+  Chars: Integer;
 begin
   Style := JStr(Block, 'style', JStr(Block, 'listStyle', 'bullet'));
+  Chars := BlockFirstLineChars(Block, 0);
   Items := JArray(Block, 'items');
   if Items = nil then
     Exit;
   for I := 0 to Items.Count - 1 do
   begin
-    Para := FDoc.AddParagraph;
+    Para := AddTrackedParagraph(Chars);
     Para.ListStyle := ParseListStyle(Style);
-    ApplyParagraphProps(Para, Block);
+    ApplyParagraphProps(Para, Block, Chars);
     if Items.Items[I] is TJSONObject then
       Run := Para.AddRun(JStr(TJSONObject(Items.Items[I]), 'text', ''))
     else
@@ -803,7 +912,7 @@ begin
     raise EDocxTemplateError.Create('图片不存在或为空：' +
       JStr(Block, 'path', '[base64]'));
 
-  Para := FDoc.AddParagraph;
+  Para := AddTrackedParagraph(0);
   Para.Alignment := ParseAlign(JStr(Block, 'align', 'center'),
     TParagraphAlignment.Center);
   Para.LineSpacing := TLineSpacing.Single;
@@ -813,7 +922,7 @@ begin
   // 图注（可选）
   if JStr(Block, 'caption', '') <> '' then
   begin
-    Para := FDoc.AddParagraph;
+    Para := AddTrackedParagraph(0);
     Para.Alignment := TParagraphAlignment.Center;
     Para.LineSpacing := TLineSpacing.Create(240, TLineSpacingRule.Auto, 60, 120);
     Run := Para.AddRun(JStr(Block, 'caption', ''));
@@ -828,7 +937,7 @@ procedure TDocxTemplate.RenderPageBreak;
 var
   Para: IWordParagraph;
 begin
-  Para := FDoc.AddParagraph;
+  Para := AddTrackedParagraph(0);
   Para.AddPageBreak;
 end;
 
@@ -851,7 +960,7 @@ begin
   else if (Kind = 'pagebreak') or (Kind = 'newpage') then
     RenderPageBreak
   else if Kind = 'spacer' then
-    FDoc.AddParagraph
+    AddTrackedParagraph(0)
   else
     raise EDocxTemplateError.Create('未知内容类型：' + Kind);
 end;
@@ -986,6 +1095,98 @@ begin
   Result := Result + Copy(Xml, P, Length(Xml) - P + 1);
 end;
 
+{ OfficeXML4D 生成的 numbering.xml 中项目符号文本为空，修补为实心圆点，
+  并补上悬挂缩进与符号字体，保证 Word / WPS 正常显示列表标记。 }
+function FixNumberingXml(const Xml: string): string;
+const
+  LevelProps = '<w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>' +
+    '<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:hint="default"/></w:rPr>';
+var
+  P, LvlStart, LvlEnd: Integer;
+  LvlXml: string;
+begin
+  Result := StringReplace(Xml, '<w:lvlText w:val=""/>',
+    '<w:lvlText w:val="' + #$2022 + '"/>', [rfReplaceAll]);
+
+  P := 1;
+  while True do
+  begin
+    LvlStart := PosEx('<w:lvl w:ilvl="', Result, P);
+    if LvlStart = 0 then
+      Break;
+    LvlEnd := PosEx('</w:lvl>', Result, LvlStart);
+    if LvlEnd = 0 then
+      Break;
+    LvlXml := Copy(Result, LvlStart, LvlEnd + 8 - LvlStart);
+    if Pos('<w:pPr>', LvlXml) = 0 then
+    begin
+      Insert(LevelProps, LvlXml, Length(LvlXml) - Length('</w:lvl>') + 1);
+      Result := Copy(Result, 1, LvlStart - 1) + LvlXml +
+        Copy(Result, LvlEnd + 8, MaxInt);
+      P := LvlStart + Length(LvlXml) + 1;
+    end
+    else
+      P := LvlEnd + 8;
+  end;
+end;
+
+function TDocxTemplate.InjectFirstLineChars(const Xml: string): string;
+var
+  P, StartPos, EndPos, ParaIdx, IndPos, PPrEnd, InsertAt, Chars, Hundredths: Integer;
+  ParaXml, IndXml: string;
+begin
+  Result := '';
+  P := 1;
+  ParaIdx := 0;
+
+  while ParaIdx <= High(FParaFirstLineChars) do
+  begin
+    StartPos := PosEx('<w:p>', Xml, P);
+    if StartPos = 0 then
+      Break;
+    EndPos := PosEx('</w:p>', Xml, StartPos + 5);
+    if EndPos = 0 then
+      Break;
+
+    Chars := FParaFirstLineChars[ParaIdx];
+    if Chars <= 0 then
+    begin
+      Result := Result + Copy(Xml, P, EndPos + 6 - P);
+    end
+    else
+    begin
+      ParaXml := Copy(Xml, StartPos, EndPos + 6 - StartPos);
+      // OOXML 的 w:firstLineChars 单位是 1/100 字符：2 字符要写 200
+      Hundredths := Chars * 100;
+      IndXml := '<w:ind w:firstLineChars="' + IntToStr(Hundredths) + '"/>';
+      PPrEnd := PosEx('</w:pPr>', ParaXml);
+      IndPos := PosEx('<w:ind', ParaXml);
+
+      if (IndPos > 0) and ((PPrEnd = 0) or (IndPos < PPrEnd)) then
+      begin
+        // 库已写入 w:firstLine（twips 兜底），补上字符数属性；Word 优先采用它
+        InsertAt := IndPos + Length('<w:ind');
+        ParaXml := Copy(ParaXml, 1, InsertAt - 1) +
+          ' w:firstLineChars="' + IntToStr(Hundredths) + '"' +
+          Copy(ParaXml, InsertAt, MaxInt);
+      end
+      else if PPrEnd > 0 then
+        ParaXml := Copy(ParaXml, 1, PPrEnd - 1) + IndXml +
+          Copy(ParaXml, PPrEnd, MaxInt)
+      else
+        ParaXml := '<w:p><w:pPr>' + IndXml + '</w:pPr>' +
+          Copy(ParaXml, Length('<w:p>') + 1, MaxInt);
+
+      Result := Result + Copy(Xml, P, StartPos - P) + ParaXml;
+    end;
+
+    P := EndPos + 6;
+    Inc(ParaIdx);
+  end;
+
+  Result := Result + Copy(Xml, P, Length(Xml) - P + 1);
+end;
+
 function TDocxTemplate.SaveWithToc(const FileName: string): Boolean;
 var
   Mem: TMemoryStream;
@@ -994,14 +1195,19 @@ var
   Names: TArray<string>;
   Contents: TArray<TBytes>;
   I: Integer;
-  Name, DocXml, RelsXml, CTXml: string;
+  Name, DocXml, RelsXml, CTXml, NumberingXml: string;
   Data: TBytes;
   NewRel: string;
-  HasSettings: Boolean;
+  HasSettings, NeedsToc, NeedsIndent, NeedsNumbering: Boolean;
 begin
-  Result := False;
-  if (not FTocEnabled) or (Length(FHeadings) = 0) then
-    Exit;
+  NeedsToc := FTocEnabled and (Length(FHeadings) > 0);
+  NeedsIndent := False;
+  for I := 0 to High(FParaFirstLineChars) do
+    if FParaFirstLineChars[I] > 0 then
+    begin
+      NeedsIndent := True;
+      Break;
+    end;
 
   Mem := TMemoryStream.Create;
   ZipIn := TZipFile.Create;
@@ -1015,6 +1221,7 @@ begin
     DocXml := '';
     RelsXml := '';
     CTXml := '';
+    NumberingXml := '';
     HasSettings := False;
 
     for I := 0 to ZipIn.FileCount - 1 do
@@ -1029,6 +1236,8 @@ begin
         DocXml := TEncoding.UTF8.GetString(Data)
       else if Name = 'word/_rels/document.xml.rels' then
         RelsXml := TEncoding.UTF8.GetString(Data)
+      else if Name = 'word/numbering.xml' then
+        NumberingXml := TEncoding.UTF8.GetString(Data)
       else if Name = '[Content_Types].xml' then
         CTXml := TEncoding.UTF8.GetString(Data);
     end;
@@ -1037,13 +1246,25 @@ begin
     Mem.Free;
   end;
 
-  // 1) 给标题段落加书签，并在正文开头插入目录页
-  DocXml := InjectBookmarks(DocXml);
-  DocXml := StringReplace(DocXml, '<w:body>',
-    '<w:body>' + BuildTocXml, []);
+  // 1) 给需要首行缩进的段落写入 w:firstLineChars（按字符宽自适应中英文）
+  if NeedsIndent then
+    DocXml := InjectFirstLineChars(DocXml);
 
-  // 2) 页码字段需要 Word 打开时更新
-  if FTocPageNumbers then
+  // 2) 给标题段落加书签，并在正文开头插入目录页
+  if NeedsToc then
+  begin
+    DocXml := InjectBookmarks(DocXml);
+    DocXml := StringReplace(DocXml, '<w:body>',
+      '<w:body>' + BuildTocXml, []);
+  end;
+
+  // 3) 修补库生成的空项目符号，让列表显示实心圆点/编号
+  NeedsNumbering := (NumberingXml <> '') and (Pos('<w:numPr>', DocXml) > 0);
+  if NeedsNumbering then
+    NumberingXml := FixNumberingXml(NumberingXml);
+
+  // 4) 页码字段需要 Word 打开时更新
+  if NeedsToc and FTocPageNumbers then
   begin
     if Pos('PartName="/word/settings.xml"', CTXml) = 0 then
       CTXml := StringReplace(CTXml, '</Types>',
@@ -1066,7 +1287,9 @@ begin
     else if Names[I] = 'word/_rels/document.xml.rels' then
       Contents[I] := TEncoding.UTF8.GetBytes(RelsXml)
     else if Names[I] = '[Content_Types].xml' then
-      Contents[I] := TEncoding.UTF8.GetBytes(CTXml);
+      Contents[I] := TEncoding.UTF8.GetBytes(CTXml)
+    else if Names[I] = 'word/numbering.xml' then
+      Contents[I] := TEncoding.UTF8.GetBytes(NumberingXml);
   end;
 
   FS := TFileStream.Create(FileName, fmCreate);
@@ -1076,7 +1299,7 @@ begin
     for I := 0 to High(Names) do
       ZipOut.Add(Contents[I], Names[I]);
 
-    if FTocPageNumbers and (not HasSettings) then
+    if NeedsToc and FTocPageNumbers and (not HasSettings) then
       ZipOut.Add(
         TEncoding.UTF8.GetBytes(
           '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
@@ -1093,7 +1316,7 @@ end;
 
 procedure TDocxTemplate.ApplyRootSettings(Root: TJSONObject);
 var
-  Page: TJSONObject;
+  Page, ParaCfg: TJSONObject;
 begin
   Page := JObj(Root, 'page');
   if Page <> nil then
@@ -1114,6 +1337,34 @@ begin
 
   FDoc.Header.Text := JStr(Root, 'header', '');
   FDoc.Footer.Text := JStr(Root, 'footer', '');
+
+  // 段落首行缩进：默认两个字符，可按全局配置覆盖或关闭
+  FDefaultFirstLineChars := 2;
+  ParaCfg := JObj(Root, 'paragraph');
+  if ParaCfg <> nil then
+  begin
+    if JValue(ParaCfg, 'firstLineChars') <> nil then
+      FDefaultFirstLineChars := JInt(ParaCfg, 'firstLineChars', 2)
+    else if JValue(ParaCfg, 'firstLineIndentChars') <> nil then
+      FDefaultFirstLineChars := JInt(ParaCfg, 'firstLineIndentChars', 2)
+    else if JValue(ParaCfg, 'indentChars') <> nil then
+      FDefaultFirstLineChars := JInt(ParaCfg, 'indentChars', 2);
+    if (JValue(ParaCfg, 'enabled') <> nil) and
+       (not JBool(ParaCfg, 'enabled', True)) then
+      FDefaultFirstLineChars := 0;
+  end
+  else
+  begin
+    if JValue(Root, 'firstLineChars') <> nil then
+      FDefaultFirstLineChars := JInt(Root, 'firstLineChars', 2)
+    else if JValue(Root, 'firstLineIndentChars') <> nil then
+      FDefaultFirstLineChars := JInt(Root, 'firstLineIndentChars', 2);
+  end;
+  if FDefaultFirstLineChars < 0 then
+    FDefaultFirstLineChars := 0;
+  if FDefaultFirstLineChars > 20 then
+    FDefaultFirstLineChars := 20;
+
   ParseTocSettings(Root);
 end;
 
@@ -1154,6 +1405,8 @@ begin
     FBaseDir := ABaseDir;
     FDoc := TWordDocumentFactory.CreateDocument;
     FHeadings := nil;
+    FParaFirstLineChars := nil;
+    FDefaultFirstLineChars := 2;
 
     ApplyRootSettings(Root);
     RenderContent(Root);

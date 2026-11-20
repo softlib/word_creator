@@ -1,0 +1,120 @@
+{
+  "header": "通用 Word 文档生成工具 · 示例输出",
+  "footer": "由 DocxGen + OfficeXML4D 生成",
+  "toc": {
+    "enabled": true,
+    "title": "目录",
+    "maxLevel": 3,
+    "pageNumbers": true,
+    "pageBreakAfter": true
+  },
+  "page": {
+    "orientation": "portrait",
+    "marginTop": 72,
+    "marginBottom": 72,
+    "marginLeft": 72,
+    "marginRight": 72
+  },
+  "content": [
+    {
+      "type": "heading",
+      "level": 1,
+      "text": "项目周报生成示例",
+      "align": "center"
+    },
+    {
+      "type": "paragraph",
+      "text": "本文件由配置驱动的工具自动生成，用于验证文字、样式、列表、表格与图片的通用生成能力。",
+      "align": "center",
+      "color": "595959",
+      "fontSize": 10,
+      "italic": true,
+      "spaceAfter": 12
+    },
+    {
+      "type": "runs",
+      "align": "left",
+      "runs": [
+        { "text": "生成技术：", "bold": true },
+        { "text": "OfficeXML4D / Delphi 11.3", "color": "1F3864" },
+        { "text": "；源码仓库：", "bold": true },
+        { "text": "点击查看", "link": "https://github.com/GDKsoftware/OfficeXML4D", "underline": true, "color": "0563C1" }
+      ]
+    },
+    {
+      "type": "heading",
+      "level": 2,
+      "text": "一、本周要点",
+      "color": "1F3864",
+      "spaceBefore": 10,
+      "spaceAfter": 4
+    },
+    {
+      "type": "list",
+      "style": "bullet",
+      "items": [
+        "完成配置解析与内容块调度框架",
+        "实现图片嵌入、尺寸识别与等比缩放",
+        "验证生成的 docx 可被 Word 正常打开"
+      ]
+    },
+    {
+      "type": "heading",
+      "level": 2,
+      "text": "二、执行步骤",
+      "color": "1F3864",
+      "spaceBefore": 10,
+      "spaceAfter": 4
+    },
+    {
+      "type": "heading",
+      "level": 3,
+      "text": "2.1 配置与运行",
+      "color": "2E5496",
+      "spaceAfter": 4
+    },
+    {
+      "type": "list",
+      "style": "numbered",
+      "items": [
+        "编写 JSON 配置文件",
+        "运行 DocxGen.exe 指定配置与输出路径",
+        "检查生成的 docx 文件内容"
+      ]
+    },
+    {
+      "type": "image",
+      "path": "images/logo.png",
+      "width": 140,
+      "align": "center",
+      "caption": "图 1：OfficeXML4D 标识（按宽度等比缩放）"
+    },
+    {
+      "type": "image",
+      "path": "images/chart.png",
+      "width": 420,
+      "align": "center",
+      "caption": "图 2：自动生成的数据图表示意"
+    },
+    {
+      "type": "heading",
+      "level": 2,
+      "text": "三、数据明细（表格在分页之后）",
+      "color": "1F3864"
+    },
+    {
+      "type": "table",
+      "headerRow": true,
+      "headerShading": "4472C4",
+      "borderColor": "808080",
+      "borderWidth": 4,
+      "widths": [2600, 1800, 1800, 2200],
+      "rows": [
+        ["模块", "负责人", "状态", "备注"],
+        ["配置解析", "张工", "完成", "支持 JSON UTF-8"],
+        ["图片嵌入", "李工", "完成", "PNG / JPEG / GIF / BMP"],
+        ["文档输出", "王工", "完成", "标准 OOXML 包"]
+      ]
+    }
+  ]
+}

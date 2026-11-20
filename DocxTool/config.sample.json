@@ -1,6 +1,10 @@
 {
   "header": "通用 Word 文档生成工具 · 示例输出",
   "footer": "由 DocxGen + OfficeXML4D 生成",
+  "paragraph": {
+    "firstLineIndentChars": 2, 
+    "enabled": true
+  },
   "toc": {
     "enabled": true,
     "title": "目录",
@@ -29,6 +33,7 @@
       "color": "595959",
       "fontSize": 10,
       "italic": true,
+      "firstLineChars": 0,
       "spaceAfter": 12
     },
     {
@@ -48,6 +53,17 @@
       "color": "1F3864",
       "spaceBefore": 10,
       "spaceAfter": 4
+    },
+    {
+      "type": "paragraph",
+      "text": "本段是中文正文，段首自动缩进两个全角字符宽；字号相同时视觉上相当于两个汉字。",
+      "spaceAfter": 6
+    },
+    {
+      "type": "paragraph",
+      "text": "This English paragraph overrides the default with a three-character first-line indent, about the width of three half-width spaces.",
+      "firstLineChars": 1,
+      "spaceAfter": 6
     },
     {
       "type": "list",
